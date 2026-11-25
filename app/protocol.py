@@ -1,0 +1,18 @@
+# Спільні параметри HTTP-запитів клієнта й сервера.
+NETWORK_TIMEOUT = 3
+PING_PATH = "/health"
+PING_RESPONSE = b"BuckLAN\n"
+LIST_PATH = "/list"
+FILE_PATH = "/file"
+FILE_PARAMETER = "path"
+QUERY_SEPARATOR = "?"
+GET_METHOD = "GET"
+AUTHORIZATION_HEADER = "Authorization"
+BEARER_TOKEN = "Bearer {token}"
+CONTENT_TYPE_HEADER = "Content-Type"
+CONTENT_LENGTH_HEADER = "Content-Length"
+TEXT_CONTENT_TYPE = "text/plain"
+JSON_CONTENT_TYPE = "application/json"
+FILE_CONTENT_TYPE = "application/octet-stream"
+FILES_KEY = "files"
+DIRECTORIES_KEY = "directories"
