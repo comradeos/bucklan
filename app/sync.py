@@ -1,27 +1,26 @@
-from errno import EEXIST, ENOTEMPTY
+from contextlib import nullcontext
+from errno import EEXIST, ENOTEMPTY, EXDEV
 import json
 import os
 from pathlib import Path
 import re
+from shutil import rmtree
 import stat
-from unicodedata import normalize
+from tempfile import TemporaryDirectory, mkdtemp
+from typing import Optional
 
 from . import messages, protocol
 from .client import fetch_file, get_response
 from .config import TOKEN_VARIABLE, read_setting, validate_token
 from .files import (
-    PATH_SEPARATOR, check_root, directory_path, file_digest, file_parts, file_path,
-    is_link, walk_folder,
+    BINARY_READ_MODE, PATH_SEPARATOR, SYNC_TEMP_PREFIX, check_root, directory_path,
+    file_parts, file_path, is_link, save_file,
 )
+from .sync_plan import Replacement, SyncPlan, entry_version, path_key, plain_contents, plan_sync
 
 
 SHA256_PATTERN = re.compile("[0-9a-f]{64}")
-UNICODE_FORM = "NFC"
-
-
-# Нормалізує ім’я для порівняння на файлових системах із різним регістром.
-def path_key(path: str) -> str:
-    return normalize(UNICODE_FORM, path).casefold()
+BACKUP_NAME = "previous"
 
 
 # Отримує список для синхронізації та перевіряє його структуру й хеші.
@@ -81,70 +80,6 @@ def manifest_paths(directories: list[str], files: dict[str, str]) -> dict[str, t
     return paths
 
 
-# Визначає, які папки створити й які файли завантажити.
-def plan_updates(
-    root: Path,
-    directories: list[str],
-    files: dict[str, str],
-    paths: dict[str, tuple[str, ...]],
-) -> tuple[list[str], list[str]]:
-    missing_directories = []
-    changed_files = []
-
-    for path in directories:
-        try:
-            directory_path(root, paths[path])
-        except FileNotFoundError:
-            missing_directories.append(path)
-
-    for path, expected_digest in sorted(files.items()):
-        try:
-            target = file_path(root, paths[path])
-        except FileNotFoundError:
-            changed_files.append(path)
-            continue
-
-        if file_digest(target) != expected_digest:
-            changed_files.append(path)
-
-    return missing_directories, changed_files
-
-
-# Запам’ятовує зайві записи, щоб видалити файли перед їхніми папками.
-def plan_deletions(
-    root: Path, paths: dict[str, tuple[str, ...]]
-) -> list[tuple[Path, os.stat_result]]:
-    protected_names = {path_key(path) for path in paths}
-
-    for parts in paths.values():
-        try:
-            existing = root.joinpath(*parts).resolve(strict=True)
-        except FileNotFoundError:
-            continue
-
-        if existing.is_relative_to(root):
-            protected_names.add(path_key(existing.relative_to(root).as_posix()))
-
-    files = []
-    directories = []
-
-    for path, metadata in walk_folder(root):
-        name = path_key(path.relative_to(root).as_posix())
-
-        if name in protected_names:
-            continue
-
-        entry = (path, metadata)
-
-        if stat.S_ISDIR(metadata.st_mode):
-            directories.append(entry)
-        else:
-            files.append(entry)
-
-    directories.sort(key=lambda entry: len(entry[0].parts), reverse=True)
-    return files + directories
-
-
 # Видаляє запланований запис, якщо це той самий файл або звичайна порожня папка.
 def delete_extra(root: Path, path: Path, previous: os.stat_result) -> bool:
     is_directory = stat.S_ISDIR(previous.st_mode)
@@ -178,7 +113,111 @@ def delete_extra(root: Path, path: Path, previous: os.stat_result) -> bool:
     return True
 
 
-# Оновлює дзеркало та видаляє зайві записи після повторної перевірки джерела.
+# Переносить запис через тимчасове ім’я та повертає його за помилки заміни.
+def move_into_place(previous: Path, target: Path, staged: Optional[Path] = None) -> None:
+    holder = Path(mkdtemp(prefix=SYNC_TEMP_PREFIX, dir=previous.parent))
+    backup = holder / BACKUP_NAME
+
+    try:
+        previous.rename(backup)
+    except OSError:
+        holder.rmdir()
+        raise
+
+    try:
+        if entry_exists(target):
+            raise ValueError(messages.SYNC_TARGET_CHANGED.format(path=target))
+
+        replacement = backup if staged is None else staged
+        replacement.rename(target)
+    except (OSError, ValueError, KeyboardInterrupt):
+        try:
+            if entry_exists(previous):
+                raise FileExistsError(previous)
+
+            backup.rename(previous)
+        except OSError as error:
+            message = messages.SYNC_RESTORE_ERROR.format(path=previous, backup=backup)
+            raise ValueError(message) from error
+
+        holder.rmdir()
+        raise
+
+    if staged is None:
+        holder.rmdir()
+    else:
+        rmtree(holder)
+
+
+# Перевіряє наявність запису, зокрема символічного посилання.
+def entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+
+    return True
+
+
+# Звіряє попередній запис і ставить на його місце підготовлений файл або папку.
+def apply_replacement(root: Path, staged: Path, change: Replacement) -> None:
+    previous = change.old.path
+    directory_path(root, previous.parent.relative_to(root).parts)
+    current = previous.lstat()
+
+    if is_link(current) or entry_version(current) != entry_version(change.old.metadata):
+        raise ValueError(messages.SYNC_TARGET_CHANGED.format(path=previous))
+
+    if change.contents is not None and plain_contents(previous) != change.contents:
+        raise ValueError(messages.SYNC_TARGET_CHANGED.format(path=previous))
+
+    move_into_place(previous, change.target, staged)
+
+
+# Встановлює підготовлений файл і підтримує окремі томи всередині дзеркала.
+def install_file(staged: Path, destination: Path) -> None:
+    try:
+        staged.replace(destination)
+        return
+    except OSError as error:
+        if error.errno != EXDEV:
+            raise
+
+    with staged.open(BINARY_READ_MODE) as source:
+        size = os.fstat(source.fileno()).st_size
+        save_file(destination, source, size)
+
+
+# Застосовує підготовлені файли й перейменовує вкладені записи перед їхніми папками.
+def apply_plan(root: Path, staging: Path, paths: dict[str, tuple[str, ...]], plan: SyncPlan) -> int:
+    for directory in plan.directories:
+        directory_path(root, directory.relative_to(root).parts, create=True)
+
+    for change in plan.replacements:
+        apply_replacement(root, staging.joinpath(*paths[change.path]), change)
+
+    for path, target in plan.installs:
+        destination = file_path(root, target.relative_to(root).parts, create_parents=True)
+        install_file(staging.joinpath(*paths[path]), destination)
+
+    removed = sum(delete_extra(root, entry.path, entry.metadata) for entry in plan.deletions)
+
+    for previous, target, is_directory in sorted(
+        plan.renames, key=lambda change: len(change[0].parts), reverse=True,
+    ):
+        parts = previous.relative_to(root).parts
+
+        if is_directory:
+            directory_path(root, parts)
+        else:
+            file_path(root, parts)
+
+        move_into_place(previous, target)
+
+    return removed
+
+
+# Готує завантаження, повторно звіряє джерело й застосовує зміни до дзеркала.
 def sync_folder(address: str, port: int, env_file: Path) -> None:
     root = check_root(env_file)
     token = validate_token(read_setting(TOKEN_VARIABLE, env_file))
@@ -186,26 +225,40 @@ def sync_folder(address: str, port: int, env_file: Path) -> None:
     paths = manifest_paths(directories, files)
 
     try:
-        missing_directories, changed_files = plan_updates(root, directories, files, paths)
-        deletions = plan_deletions(root, paths)
-
-        for path in missing_directories:
-            directory_path(root, paths[path], create=True)
+        plan = plan_sync(root, directories, files, paths)
     except OSError as error:
         raise ValueError(messages.SYNC_FOLDER_ERROR.format(error=error)) from error
 
-    for path in changed_files:
-        fetch_file(address, port, path, root, token, expected_digest=files[path])
+    staging_context = nullcontext(root)
 
-    removed = 0
+    try:
+        if plan.downloads or plan.staged_directories:
+            staging_context = TemporaryDirectory(prefix=SYNC_TEMP_PREFIX, dir=root)
 
-    if deletions:
-        if read_manifest(address, port, token) != (directories, files):
-            raise ValueError(messages.SYNC_SOURCE_CHANGED)
+        with staging_context as directory:
+            staging = Path(directory)
 
-        for path, metadata in deletions:
-            removed += delete_extra(root, path, metadata)
+            for path in plan.staged_directories:
+                directory_path(staging, paths[path], create=True)
+
+            for path in plan.downloads:
+                fetch_file(address, port, path, staging, token, expected_digest=files[path])
+
+            if plan.deletions or plan.replacements or plan.renames:
+                if read_manifest(address, port, token) != (directories, files):
+                    raise ValueError(messages.SYNC_SOURCE_CHANGED)
+
+            removed = apply_plan(root, staging, paths, plan)
+    except OSError as error:
+        raise ValueError(messages.SYNC_APPLY_ERROR.format(error=error)) from error
 
     print(messages.SYNC_TOTALS.format(
-        files=len(changed_files), directories=len(missing_directories), removed=removed,
+        files=len(plan.downloads),
+        directories=len(plan.directories) + len(plan.staged_directories),
+        removed=removed,
     ))
+
+    if plan.renames or plan.replacements:
+        print(messages.SYNC_STRUCTURAL_TOTALS.format(
+            renamed=len(plan.renames), replaced=len(plan.replacements),
+        ))

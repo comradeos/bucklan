@@ -16,6 +16,7 @@ INVALID_FILENAME_ENDINGS = (".", " ")
 FILE_ATTRIBUTES = "st_file_attributes"
 TRANSFER_CHUNK_SIZE = 64 * 1024
 TEMP_FILE_PREFIX = ".bucklan-"
+SYNC_TEMP_PREFIX = ".bucklan-sync-"
 BINARY_WRITE_MODE = "wb"
 BINARY_READ_MODE = "rb"
 
@@ -32,6 +33,9 @@ def file_parts(relative_path: str) -> tuple[str, ...]:
             raise ValueError(messages.INVALID_FILE_PATH)
 
         if PureWindowsPath(part).is_reserved():
+            raise ValueError(messages.INVALID_FILE_PATH)
+
+        if part.casefold().startswith(SYNC_TEMP_PREFIX):
             raise ValueError(messages.INVALID_FILE_PATH)
 
     return parts
@@ -157,7 +161,7 @@ def check_root(env_file: Path) -> Path:
 
 
 # Перебирає звичайні файли й папки без переходу за посиланнями.
-def walk_folder(root: Path) -> Iterator[tuple[Path, os.stat_result]]:
+def walk_folder(root: Path, *, require_plain: bool = False) -> Iterator[tuple[Path, os.stat_result]]:
     pending = [root]
 
     while pending:
@@ -168,16 +172,27 @@ def walk_folder(root: Path) -> Iterator[tuple[Path, os.stat_result]]:
             raise ValueError(messages.UNSAFE_DIRECTORY_PATH.format(path=directory))
 
         for path in directory.iterdir():
-            metadata = path.lstat()
+            if path.name.casefold().startswith(SYNC_TEMP_PREFIX):
+                if require_plain:
+                    raise ValueError(messages.SYNC_SPECIAL_ENTRY.format(path=path))
 
-            if is_link(metadata):
                 continue
 
-            if stat.S_ISDIR(metadata.st_mode):
+            metadata = path.lstat()
+
+            is_directory = stat.S_ISDIR(metadata.st_mode)
+            is_file = stat.S_ISREG(metadata.st_mode)
+
+            if is_link(metadata) or not (is_directory or is_file):
+                if require_plain:
+                    raise ValueError(messages.SYNC_SPECIAL_ENTRY.format(path=path))
+
+                continue
+
+            if is_directory:
                 pending.append(path)
-                yield path, metadata
-            elif stat.S_ISREG(metadata.st_mode):
-                yield path, metadata
+
+            yield path, metadata
 
 
 # Збирає відсортовані відносні шляхи файлів і папок для команди list.
