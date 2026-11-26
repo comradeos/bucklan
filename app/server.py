@@ -8,13 +8,13 @@ from urllib.parse import parse_qs
 
 from . import messages, protocol
 from .config import TOKEN_VARIABLE, read_setting, validate_token
-from .files import check_root, copy_bytes, file_parts, file_path, list_folder
+from .files import BINARY_READ_MODE, check_root, copy_bytes, file_parts, file_path
+from .files import folder_manifest, list_folder
 
 
 LISTEN_ADDRESS = "0.0.0.0"
 REQUEST_HEADER_ENCODING = "latin-1"
 RESPONSE_ENCODING = "ascii"
-BINARY_READ_MODE = "rb"
 
 
 class BuckLANServer(ThreadingHTTPServer):
@@ -33,8 +33,11 @@ class BuckLANHandler(BaseHTTPRequestHandler):
 
         root = self.server.root
         route, _, query = self.path.partition(protocol.QUERY_SEPARATOR)
+        endpoint = route if route == protocol.FILE_PATH else self.path
 
-        if root is None or (self.path != protocol.LIST_PATH and route != protocol.FILE_PATH):
+        file_endpoints = (protocol.LIST_PATH, protocol.MANIFEST_PATH, protocol.FILE_PATH)
+
+        if root is None or endpoint not in file_endpoints:
             self.reply(404)
             return
 
@@ -45,16 +48,16 @@ class BuckLANHandler(BaseHTTPRequestHandler):
             self.reply(401)
             return
 
-        if self.path == protocol.LIST_PATH:
-            self.send_listing(root)
-        else:
+        if endpoint == protocol.FILE_PATH:
             self.send_file(root, query)
+        else:
+            self.send_listing(root, include_hashes=endpoint == protocol.MANIFEST_PATH)
 
-    # Створює й надсилає список вмісту папки-джерела.
-    def send_listing(self, root: Path) -> None:
+    # Надсилає список файлів і папок та за потреби додає хеші.
+    def send_listing(self, root: Path, *, include_hashes: bool) -> None:
         try:
-            listing = list_folder(root)
-        except OSError:
+            listing = folder_manifest(root) if include_hashes else list_folder(root)
+        except (OSError, ValueError):
             self.reply(500)
             return
 

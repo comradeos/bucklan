@@ -1,8 +1,9 @@
+from hashlib import sha256
 import os
 from pathlib import Path, PureWindowsPath
 import stat
 from tempfile import NamedTemporaryFile
-from typing import BinaryIO
+from typing import BinaryIO, Iterator, Optional
 
 from . import messages, protocol
 from .config import ROOT_VARIABLE, read_setting
@@ -16,6 +17,7 @@ FILE_ATTRIBUTES = "st_file_attributes"
 TRANSFER_CHUNK_SIZE = 64 * 1024
 TEMP_FILE_PREFIX = ".bucklan-"
 BINARY_WRITE_MODE = "wb"
+BINARY_READ_MODE = "rb"
 
 
 # Розбиває відносний шлях на компоненти, придатні для macOS, Windows і Linux.
@@ -41,25 +43,31 @@ def is_link(metadata: os.stat_result) -> bool:
     return stat.S_ISLNK(metadata.st_mode) or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-# Перевіряє компоненти шляху та за потреби створює папки для завантаження.
-def file_path(root: Path, parts: tuple[str, ...], *, create_parents: bool = False) -> Path:
+# Перевіряє шлях до папки й за потреби створює відсутні компоненти.
+def directory_path(root: Path, parts: tuple[str, ...], *, create: bool = False) -> Path:
     parent = root
     metadata = parent.lstat()
 
-    for name in parts[:-1]:
+    for name in parts:
         if is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError(messages.UNSAFE_FILE_PATH.format(path=parent))
+            raise ValueError(messages.UNSAFE_DIRECTORY_PATH.format(path=parent))
 
         parent = parent / name
 
-        if create_parents:
+        if create:
             parent.mkdir(exist_ok=True)
 
         metadata = parent.lstat()
 
     if is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError(messages.UNSAFE_FILE_PATH.format(path=parent))
+        raise ValueError(messages.UNSAFE_DIRECTORY_PATH.format(path=parent))
 
+    return parent
+
+
+# Перевіряє шлях до звичайного файла й за потреби готує його батьківську папку.
+def file_path(root: Path, parts: tuple[str, ...], *, create_parents: bool = False) -> Path:
+    parent = directory_path(root, parts[:-1], create=create_parents)
     path = parent / parts[-1]
 
     try:
@@ -90,8 +98,21 @@ def copy_bytes(source: BinaryIO, destination: BinaryIO, size: int) -> None:
         remaining -= len(chunk)
 
 
-# Записує потік у тимчасовий файл поруч із цільовим і замінює ціль після запису.
-def save_file(path: Path, source: BinaryIO, size: int) -> None:
+# Обчислює SHA-256 файла, читаючи його частинами.
+def file_digest(path: Path) -> str:
+    digest = sha256()
+
+    with path.open(BINARY_READ_MODE) as source:
+        for chunk in iter(lambda: source.read(TRANSFER_CHUNK_SIZE), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+# Записує потік у тимчасовий файл і замінює ціль після перевірки.
+def save_file(
+    path: Path, source: BinaryIO, size: int, expected_digest: Optional[str] = None
+) -> None:
     temporary = None
 
     try:
@@ -100,6 +121,9 @@ def save_file(path: Path, source: BinaryIO, size: int) -> None:
         ) as output:
             temporary = Path(output.name)
             copy_bytes(source, output, size)
+
+        if expected_digest is not None and file_digest(temporary) != expected_digest:
+            raise ValueError(messages.FILE_DIGEST_MISMATCH.format(path=path))
 
         temporary.replace(path)
     finally:
@@ -132,14 +156,16 @@ def check_root(env_file: Path) -> Path:
     return root
 
 
-# Збирає відносні шляхи звичайних файлів і папок без переходу за посиланнями.
-def list_folder(root: Path) -> dict[str, list[str]]:
-    files = []
-    directories = []
+# Перебирає звичайні файли й папки без переходу за посиланнями.
+def walk_folder(root: Path) -> Iterator[tuple[Path, os.stat_result]]:
     pending = [root]
 
     while pending:
         directory = pending.pop()
+        metadata = directory.lstat()
+
+        if is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(messages.UNSAFE_DIRECTORY_PATH.format(path=directory))
 
         for path in directory.iterdir():
             metadata = path.lstat()
@@ -147,12 +173,40 @@ def list_folder(root: Path) -> dict[str, list[str]]:
             if is_link(metadata):
                 continue
 
-            relative_path = path.relative_to(root).as_posix()
-
             if stat.S_ISDIR(metadata.st_mode):
-                directories.append(relative_path)
                 pending.append(path)
+                yield path, metadata
             elif stat.S_ISREG(metadata.st_mode):
-                files.append(relative_path)
+                yield path, metadata
+
+
+# Збирає відсортовані відносні шляхи файлів і папок для команди list.
+def list_folder(root: Path) -> dict[str, list[str]]:
+    files = []
+    directories = []
+
+    for path, metadata in walk_folder(root):
+        relative_path = path.relative_to(root).as_posix()
+
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.append(relative_path)
+        else:
+            files.append(relative_path)
 
     return {protocol.FILES_KEY: sorted(files), protocol.DIRECTORIES_KEY: sorted(directories)}
+
+
+# Збирає відносні шляхи папок і хеші файлів для синхронізації.
+def folder_manifest(root: Path) -> dict[str, object]:
+    files = {}
+    directories = []
+
+    for path, metadata in walk_folder(root):
+        relative_path = path.relative_to(root).as_posix()
+
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.append(relative_path)
+        else:
+            files[relative_path] = file_digest(path)
+
+    return {protocol.FILES_KEY: files, protocol.DIRECTORIES_KEY: sorted(directories)}

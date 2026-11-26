@@ -1,8 +1,10 @@
 # Спільні параметри HTTP-запитів клієнта й сервера.
 NETWORK_TIMEOUT = 3
+MANIFEST_TIMEOUT = 60
 PING_PATH = "/health"
 PING_RESPONSE = b"BuckLAN\n"
 LIST_PATH = "/list"
+MANIFEST_PATH = "/manifest"
 FILE_PATH = "/file"
 FILE_PARAMETER = "path"
 QUERY_SEPARATOR = "?"

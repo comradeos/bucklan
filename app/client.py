@@ -24,7 +24,12 @@ def open_response(
     except ValueError as error:
         raise ValueError(messages.INVALID_ADDRESS.format(address=address)) from error
 
-    connection = HTTPConnection(host, port, timeout=protocol.NETWORK_TIMEOUT)
+    timeout = protocol.NETWORK_TIMEOUT
+
+    if endpoint == protocol.MANIFEST_PATH:
+        timeout = protocol.MANIFEST_TIMEOUT
+
+    connection = HTTPConnection(host, port, timeout=timeout)
     headers = {}
 
     if token is not None:
@@ -95,9 +100,24 @@ def show_listing(address: str, port: int, env_file: Path) -> None:
 
 # Завантажує один файл і зберігає його за тим самим відносним шляхом.
 def download_file(address: str, port: int, relative_path: str, env_file: Path) -> None:
-    parts = file_parts(relative_path)
     root = check_root(env_file)
     token = validate_token(read_setting(TOKEN_VARIABLE, env_file))
+    target = fetch_file(address, port, relative_path, root, token)
+
+    print(messages.FILE_DOWNLOADED.format(path=target))
+
+
+# Отримує файл за відносним шляхом і за потреби перевіряє його хеш.
+def fetch_file(
+    address: str,
+    port: int,
+    relative_path: str,
+    root: Path,
+    token: str,
+    *,
+    expected_digest: Optional[str] = None,
+) -> Path:
+    parts = file_parts(relative_path)
     query = urlencode({protocol.FILE_PARAMETER: relative_path})
     endpoint = protocol.QUERY_SEPARATOR.join((protocol.FILE_PATH, query))
 
@@ -123,9 +143,9 @@ def download_file(address: str, port: int, relative_path: str, env_file: Path) -
 
         try:
             target = file_path(root, parts, create_parents=True)
-            save_file(target, response, size)
+            save_file(target, response, size, expected_digest)
         except (OSError, EOFError) as error:
             message = messages.FILE_DOWNLOAD_ERROR.format(path=relative_path, error=error)
             raise ValueError(message) from error
 
-    print(messages.FILE_DOWNLOADED.format(path=target))
+    return target
