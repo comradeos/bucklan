@@ -6,11 +6,13 @@ from pathlib import Path
 import re
 from shutil import rmtree
 import stat
+import sys
 from tempfile import TemporaryDirectory, mkdtemp
+from time import sleep
 from typing import Optional
 
 from . import messages, protocol
-from .client import fetch_file, get_response
+from .client import fetch_file, get_response, parse_ipv4
 from .config import TOKEN_VARIABLE, read_setting, validate_token
 from .files import (
     BINARY_READ_MODE, PATH_SEPARATOR, SYNC_TEMP_PREFIX, check_root, directory_path,
@@ -21,6 +23,7 @@ from .sync_plan import Replacement, SyncPlan, entry_version, path_key, plain_con
 
 SHA256_PATTERN = re.compile("[0-9a-f]{64}")
 BACKUP_NAME = "previous"
+WATCH_INTERVAL = 15
 
 
 # Отримує список для синхронізації та перевіряє його структуру й хеші.
@@ -262,3 +265,21 @@ def sync_folder(address: str, port: int, env_file: Path) -> None:
         print(messages.SYNC_STRUCTURAL_TOTALS.format(
             renamed=len(plan.renames), replaced=len(plan.replacements),
         ))
+
+
+# Послідовно повторює синхронізацію й завершується після Ctrl+C.
+def watch_folder(address: str, port: int, env_file: Path) -> None:
+    host = parse_ipv4(address)
+    print(messages.WATCH_STARTED.format(interval=WATCH_INTERVAL), flush=True)
+
+    try:
+        while True:
+            try:
+                sync_folder(host, port, env_file)
+            except ValueError as error:
+                message = messages.WATCH_RETRY.format(error=error, interval=WATCH_INTERVAL)
+                print(message, file=sys.stderr)
+
+            sleep(WATCH_INTERVAL)
+    except KeyboardInterrupt:
+        print(messages.WATCH_STOPPED)

@@ -11,6 +11,14 @@ from .config import TOKEN_VARIABLE, read_setting, validate_token
 from .files import check_root, file_parts, file_path, save_file
 
 
+# Перевіряє IPv4-адресу й повертає її в канонічному вигляді.
+def parse_ipv4(address: str) -> str:
+    try:
+        return str(IPv4Address(address))
+    except ValueError as error:
+        raise ValueError(messages.INVALID_ADDRESS.format(address=address)) from error
+
+
 # Надсилає GET-запит і тримає з’єднання відкритим, поки клієнт читає відповідь.
 @contextmanager
 def open_response(
@@ -19,11 +27,7 @@ def open_response(
     endpoint: str,
     token: Optional[str] = None,
 ) -> Iterator[HTTPResponse]:
-    try:
-        host = str(IPv4Address(address))
-    except ValueError as error:
-        raise ValueError(messages.INVALID_ADDRESS.format(address=address)) from error
-
+    host = parse_ipv4(address)
     timeout = protocol.NETWORK_TIMEOUT
 
     if endpoint == protocol.MANIFEST_PATH:

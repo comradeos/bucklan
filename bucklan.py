@@ -7,7 +7,7 @@ from app.client import download_file, ping, show_listing
 from app.config import ENV_FILENAME, read_port
 from app.files import check_root
 from app.server import serve
-from app.sync import sync_folder
+from app.sync import sync_folder, watch_folder
 
 
 ENV_FILE = Path(__file__).resolve().with_name(ENV_FILENAME)
@@ -17,6 +17,7 @@ PING_COMMAND = "ping"
 LIST_COMMAND = "list"
 GET_COMMAND = "get"
 SYNC_COMMAND = "sync"
+WATCH_OPTION = "--watch"
 IP_ARGUMENT = "ip"
 PATH_ARGUMENT = "path"
 
@@ -51,6 +52,7 @@ def main() -> int:
     sync_parser.add_argument(
         IP_ARGUMENT, metavar=messages.IP_ADDRESS_LABEL, help=messages.IP_ADDRESS_HELP
     )
+    sync_parser.add_argument(WATCH_OPTION, action="store_true", help=messages.WATCH_HELP)
 
     args = parser.parse_args()
 
@@ -65,6 +67,8 @@ def main() -> int:
             show_listing(args.ip, read_port(ENV_FILE), ENV_FILE)
         elif args.command == GET_COMMAND:
             download_file(args.ip, read_port(ENV_FILE), args.path, ENV_FILE)
+        elif args.watch:
+            watch_folder(args.ip, read_port(ENV_FILE), ENV_FILE)
         else:
             sync_folder(args.ip, read_port(ENV_FILE), ENV_FILE)
     except ValueError as error:
